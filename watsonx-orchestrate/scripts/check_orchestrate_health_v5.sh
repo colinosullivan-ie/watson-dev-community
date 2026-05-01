@@ -1091,9 +1091,24 @@ print_header() {
   fi
   print_box_blank
   
-  # Get WO CR info
+  # Get WO CR info for version and hotfix
   OCN="$OC -n $PROJECT_CPD_INST_OPERANDS"
   wo_name=`$OCN get wo --no-headers 2>/dev/null | awk 'NR==1 {print $1}'` || :
+  
+  # Version and Hotfix
+  if [ -n "$wo_name" ]; then
+    wo_version=`$OCN get wo "$wo_name" -o jsonpath='{.spec.version}' 2>/dev/null || :`
+    hotfix_label=`$OCN get wo "$wo_name" -o jsonpath='{.metadata.labels.hotfix}' 2>/dev/null || :`
+    
+    if [ -n "$wo_version" ]; then
+      if [ -n "$hotfix_label" ]; then
+        print_box_line "Version: $wo_version $hotfix_label"
+      else
+        print_box_line "Version: $wo_version"
+      fi
+      print_box_blank
+    fi
+  fi
   
   if [ -n "$wo_name" ]; then
     # DocProc (agentic document processing)
@@ -1526,11 +1541,30 @@ check_wo_cr() {
   wo_status=`$OCN get wo "$wo_name" -o jsonpath='{.status.watsonxOrchestrateStatus}' 2>/dev/null || :`
   wo_progress=`$OCN get wo "$wo_name" -o jsonpath='{.status.progress}' 2>/dev/null || :`
   
+  # Get registryPrefix
+  registry_prefix=`$OCN get wo "$wo_name" -o jsonpath='{.spec.image.registryPrefix}' 2>/dev/null || :`
+  
+  # Build additional info string
+  additional_info=""
+  if [ -n "$registry_prefix" ] && [ "$registry_prefix" != "cp.icr.io" ]; then
+    additional_info="${additional_info}RegistryPrefix=$registry_prefix, "
+  fi
+  # Remove trailing comma and space if present
+  additional_info="${additional_info%, }"
+  
   if [ "$wo_ready" = "True" ] && [ "$wo_status" = "Completed" ] && [ "$wo_progress" = "100%" ]; then
-    echo "  ✅ watsonx Orchestrate ($wo_name): Ready=True, Status=Completed, Progress=100%"
+    if [ -n "$additional_info" ]; then
+      echo "  ✅ watsonx Orchestrate ($wo_name): Ready=True, Status=Completed, Progress=100%, ${additional_info}"
+    else
+      echo "  ✅ watsonx Orchestrate ($wo_name): Ready=True, Status=Completed, Progress=100%"
+    fi
     return 0
   else
-    echo "  ❌ watsonx Orchestrate ($wo_name): Ready=$wo_ready, Status=$wo_status, Progress=$wo_progress"
+    if [ -n "$additional_info" ]; then
+      echo "  ❌ watsonx Orchestrate ($wo_name): Ready=$wo_ready, Status=$wo_status, Progress=$wo_progress, ${additional_info}"
+    else
+      echo "  ❌ watsonx Orchestrate ($wo_name): Ready=$wo_ready, Status=$wo_status, Progress=$wo_progress"
+    fi
     return 1
   fi
 }
@@ -4657,7 +4691,6 @@ run_health_checks() {
 
   # Check operand deployments for hands-off annotation
   check_operand_deployments_hands_off || :
-  echo
 
   section "Checking Orchestrate Jobs"
   if [ "${CHECK_JOBS:-1}" -eq 1 ]; then jobs_ok=1; if check_jobs; then jobs_ok=0; fi; fi
