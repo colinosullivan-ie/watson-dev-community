@@ -62,6 +62,7 @@
 #        --assume-agentic-skills-assistant  Assume agentic_skills_assistant edition
 #    -y, --yes                              Bypass troubleshoot mode warning prompt
 #    -d, --debug                            Enable debug mode
+#    -p, --check-permissions                Check if user has required permissions and exit
 #    -h, --help                             Show help message
 
 set -eu
@@ -98,6 +99,8 @@ ASSUME_EDITION=""
 : "${TROUBLESHOOT_MODE:=0}"
 # Configuration mode - disabled by default
 : "${CONFIG_MODE:=0}"
+# Check permissions only - disabled by default
+: "${CHECK_PERMISSIONS_ONLY:=0}"
 # Skip troubleshoot warning prompt - disabled by default
 : "${SKIP_WARNING:=0}"
 # Debug mode - disabled by default
@@ -135,6 +138,7 @@ while [ $# -gt 0 ]; do
     --assume-agentic-skills-assistant)  ASSUME_EDITION="agentic_skills_assistant"; shift 1 ;;
     -t|--troubleshoot) TROUBLESHOOT_MODE=1; shift 1 ;;
     -c|--config) CONFIG_MODE=1; shift 1 ;;
+    -p|--check-permissions) CHECK_PERMISSIONS_ONLY=1; shift 1 ;;
     -y|--yes) SKIP_WARNING=1; shift 1 ;;
     -d|--debug) DEBUG_MODE=1; shift 1 ;;
     -h|--help) sed -n "1,$(awk '/^[^#]/{print NR-1; exit}' "$0")p" "$0"; exit 0 ;;
@@ -254,6 +258,138 @@ get_wo_models_info() {
   fi
   
   rm -f "$tmp_models"
+}
+
+# ==================== Permissions Check Function ====================
+
+check_required_permissions() {
+  echo ""
+  echo "╔══════════════════════════════════════════════════════════════════════════════╗"
+  echo "║                    Checking OpenShift Permissions                            ║"
+  echo "╚══════════════════════════════════════════════════════════════════════════════╝"
+  echo ""
+  
+  local all_ok=0
+  local failed_count=0
+  local mode="${1:-read}"  # read or write
+  
+  # Define permissions to check based on mode
+  local read_permissions=(
+    "namespaces:get"
+    "namespaces:list"
+    "pods:get:--all-namespaces"
+    "pods:list:--all-namespaces"
+    "pods/log:get:--all-namespaces"
+    "deployments:get:--all-namespaces"
+    "deployments:list:--all-namespaces"
+    "statefulsets:get:--all-namespaces"
+    "jobs:get:--all-namespaces"
+    "jobs:list:--all-namespaces"
+    "secrets:get:--all-namespaces"
+    "persistentvolumeclaims:get:--all-namespaces"
+  )
+  
+  local write_permissions=(
+    "pods:delete:--all-namespaces"
+    "pods/exec:create:--all-namespaces"
+    "deployments:patch:--all-namespaces"
+    "deployments/scale:update:--all-namespaces"
+    "statefulsets:patch:--all-namespaces"
+    "statefulsets/scale:update:--all-namespaces"
+    "jobs:delete:--all-namespaces"
+    "secrets:create:--all-namespaces"
+    "secrets:patch:--all-namespaces"
+    "persistentvolumeclaims:delete:--all-namespaces"
+  )
+  
+  local custom_resources=(
+    "wo:get:--all-namespaces"
+    "wocomponentservices.wo.watsonx.ibm.com:get:--all-namespaces"
+    "wa:get:--all-namespaces"
+    "watsonxaiifm:get:--all-namespaces"
+    "documentprocessings.watsonx.ibm.com:get:--all-namespaces"
+    "digitalemployees.wo.watsonx.ibm.com:get:--all-namespaces"
+    "uabautomationdecisionservices.uab.ba.ibm.com:get:--all-namespaces"
+    "clusters.postgresql.k8s.enterprisedb.io:get:--all-namespaces"
+    "rediscps.redis.ibm.com:get:--all-namespaces"
+    "kafka:get:--all-namespaces"
+    "kafkas.ibmevents.ibm.com:get:--all-namespaces"
+    "kafkausers.ibmevents.ibm.com:get:--all-namespaces"
+    "knativeeventings.operator.knative.dev:get:--all-namespaces"
+    "knativekafkas.operator.serverless.openshift.io:get:--all-namespaces"
+    "brokers.eventing.knative.dev:get:--all-namespaces"
+    "triggers.eventing.knative.dev:get:--all-namespaces"
+    "wxdengines.watsonxdata.ibm.com:get:--all-namespaces"
+    "obc:get:--all-namespaces"
+    "noobaa:get:--all-namespaces"
+    "backingstores:get:--all-namespaces"
+  )
+  
+  local write_custom_resources=(
+    "brokers.eventing.knative.dev:delete:--all-namespaces"
+    "triggers.eventing.knative.dev:delete:--all-namespaces"
+  )
+  
+  echo "Checking core read permissions..."
+  for perm in "${read_permissions[@]}"; do
+    IFS=':' read -r resource verb flags <<< "$perm"
+    if $OC auth can-i "$verb" "$resource" $flags >/dev/null 2>&1; then
+      echo "  ✅ $verb $resource"
+    else
+      echo "  ❌ $verb $resource"
+      failed_count=$((failed_count + 1))
+    fi
+  done
+  
+  if [ "$mode" = "write" ] || [ "${TROUBLESHOOT_MODE:-0}" -eq 1 ]; then
+    echo ""
+    echo "Checking write permissions (required for troubleshoot mode)..."
+    for perm in "${write_permissions[@]}"; do
+      IFS=':' read -r resource verb flags <<< "$perm"
+      if $OC auth can-i "$verb" "$resource" $flags >/dev/null 2>&1; then
+        echo "  ✅ $verb $resource"
+      else
+        echo "  ❌ $verb $resource"
+        failed_count=$((failed_count + 1))
+      fi
+    done
+  fi
+  
+  echo ""
+  echo "Checking custom resource permissions..."
+  for perm in "${custom_resources[@]}"; do
+    IFS=':' read -r resource verb flags <<< "$perm"
+    if $OC auth can-i "$verb" "$resource" $flags >/dev/null 2>&1; then
+      echo "  ✅ $verb $resource"
+    else
+      echo "  ⚠️  $verb $resource (may not be installed)"
+    fi
+  done
+  
+  if [ "$mode" = "write" ] || [ "${TROUBLESHOOT_MODE:-0}" -eq 1 ]; then
+    echo ""
+    echo "Checking custom resource write permissions (troubleshoot mode)..."
+    for perm in "${write_custom_resources[@]}"; do
+      IFS=':' read -r resource verb flags <<< "$perm"
+      if $OC auth can-i "$verb" "$resource" $flags >/dev/null 2>&1; then
+        echo "  ✅ $verb $resource"
+      else
+        echo "  ⚠️  $verb $resource (may not be installed)"
+      fi
+    done
+  fi
+  
+  echo ""
+  if [ $failed_count -eq 0 ]; then
+    echo "✅ All required core permissions are available"
+    return 0
+  else
+    echo "❌ Missing $failed_count required core permission(s)"
+    echo ""
+    echo "To grant permissions, create a ClusterRole and ClusterRoleBinding."
+    echo "See script documentation for RBAC configuration examples."
+    return 1
+  fi
 }
 
 # ==================== Configuration Mode Functions ====================
@@ -4511,6 +4647,32 @@ trap 'echo; echo "Interrupted. Exiting."; exit 1' INT TERM
 if [ "${CONFIG_MODE:-0}" -eq 1 ]; then
   run_configuration_mode
   # Configuration mode exits within the function, so this line is never reached
+fi
+
+# Check permissions if requested or in troubleshoot mode
+if [ "${CHECK_PERMISSIONS_ONLY:-0}" -eq 1 ]; then
+  check_required_permissions "write"
+  exit $?
+elif [ "${TROUBLESHOOT_MODE:-0}" -eq 1 ]; then
+  echo ""
+  echo "Verifying permissions for troubleshoot mode..."
+  if ! check_required_permissions "write"; then
+    echo ""
+    echo "⚠️  WARNING: Some required permissions are missing."
+    echo "Troubleshoot mode may fail or have limited functionality."
+    echo ""
+    read -p "Continue anyway? (y/N): " -n 1 -r </dev/tty
+    echo
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+      echo "Exiting."
+      exit 1
+    fi
+  fi
+else
+  # Quick permission check for read-only mode in debug mode
+  if [ "${DEBUG_MODE:-0}" -eq 1 ]; then
+    check_required_permissions "read"
+  fi
 fi
 
 # Show troubleshoot warning BEFORE header (if troubleshoot mode is enabled)
