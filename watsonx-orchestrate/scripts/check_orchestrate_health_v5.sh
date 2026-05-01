@@ -1414,9 +1414,11 @@ check_wo_pods() {
   OCN="$OC -n $PROJECT_CPD_INST_OPERANDS"
   bad_found=0
   total_wo=0
+  hands_off_found=0
   echo "▶ Checking Orchestrate pods"
   tmp_list=`mktemp 2>/dev/null || echo "/tmp/wo_pods.$$"`
   tmp_bad=`mktemp 2>/dev/null || echo "/tmp/wo_bad.$$"`
+  tmp_hands_off=`mktemp 2>/dev/null || echo "/tmp/wo_hands_off.$$"`
   $OCN get pods --no-headers 2>/dev/null > "$tmp_list" || :
   while IFS= read -r line; do
     name="$(printf '%s
@@ -1432,6 +1434,14 @@ check_wo_pods() {
     [ -z "$name" ] && continue
     case "$name" in wo-*|tf-*|*milvus*) : ;; *) continue ;; esac
     total_wo=`expr "${total_wo:-0}" + 1`
+    
+    # Check for hands-off annotation
+    hands_off_annotation=`$OCN get pod "$name" -o jsonpath='{.metadata.annotations.wo\.watsonx\.ibm\.com/hands-off}' 2>/dev/null || :`
+    if [ "$hands_off_annotation" = "true" ]; then
+      printf "%s\t%s\t%s\t%s\t%s\n" "$name" "$ready" "$status" "${restarts:-?}" "${age:-?}" >> "$tmp_hands_off"
+      hands_off_found=1
+    fi
+    
     if [ "$status" = "Completed" ]; then continue; fi
     current=`echo "$ready" | awk -F/ '{print $1}'`
     total=`echo "$ready" | awk -F/ '{print $2}'`
@@ -1444,12 +1454,20 @@ check_wo_pods() {
 
   if [ "${total_wo:-0}" -eq 0 ]; then
     echo "  ❌ No pods found with prefix 'wo-' in namespace $PROJECT_CPD_INST_OPERANDS."
-    rm -f "$tmp_list" "$tmp_bad"
+    rm -f "$tmp_list" "$tmp_bad" "$tmp_hands_off"
     return 1
   fi
+  
+  # Display hands-off pods if found
+  if [ "${hands_off_found:-0}" -eq 1 ]; then
+    echo "  ⚠️  Pods with 'wo.watsonx.ibm.com/hands-off: true' annotation (operator will not manage):"
+    awk -F"\t" '{printf "     - %s\n",$1}' "$tmp_hands_off"
+    echo ""
+  fi
+  
   if [ "${bad_found:-0}" -eq 0 ]; then
     echo "  ✅ All Orchestrate pods are healthy"
-    rm -f "$tmp_list" "$tmp_bad"
+    rm -f "$tmp_list" "$tmp_bad" "$tmp_hands_off"
     return 0
   else
     echo "  ❌ Some pods are not healthy. Pods with issues:"
@@ -1459,9 +1477,45 @@ check_wo_pods() {
     if [ "${TROUBLESHOOT_MODE:-0}" -eq 1 ]; then
       prompt_restart_bad_pods "$PROJECT_CPD_INST_OPERANDS" "$tmp_bad"
     fi
-    rm -f "$tmp_list" "$tmp_bad"
+    rm -f "$tmp_list" "$tmp_bad" "$tmp_hands_off"
     return 1
   fi
+}
+
+check_operand_deployments_hands_off() {
+  OCN="$OC -n $PROJECT_CPD_INST_OPERANDS"
+  local hands_off_found=0
+  
+  echo "▶ Checking Orchestrate deployments for hands-off annotation"
+  
+  # Get all deployments in operands namespace
+  tmp_deployments=`mktemp 2>/dev/null || echo "/tmp/wo_deployments.$$"`
+  $OCN get deployments --no-headers 2>/dev/null | awk '{print $1}' > "$tmp_deployments" || :
+  
+  tmp_hands_off_deps=`mktemp 2>/dev/null || echo "/tmp/wo_hands_off_deps.$$"`
+  
+  while IFS= read -r dep_name; do
+    [ -z "$dep_name" ] && continue
+    
+    # Check for hands-off annotation
+    hands_off_annotation=`$OCN get deployment "$dep_name" -o jsonpath='{.metadata.annotations.wo\.watsonx\.ibm\.com/hands-off}' 2>/dev/null || :`
+    if [ "$hands_off_annotation" = "true" ]; then
+      printf "%s\n" "$dep_name" >> "$tmp_hands_off_deps"
+      hands_off_found=1
+    fi
+  done < "$tmp_deployments"
+  
+  rm -f "$tmp_deployments"
+  
+  if [ "$hands_off_found" -eq 1 ]; then
+    echo "  ⚠️  Deployments with 'wo.watsonx.ibm.com/hands-off: true' annotation (operator will not manage):"
+    awk '{printf "     - %s\n",$1}' "$tmp_hands_off_deps"
+  else
+    echo "  ✅ No deployments with hands-off annotation found"
+  fi
+  
+  rm -f "$tmp_hands_off_deps"
+  return 0
 }
 
 check_wo_cr() {
@@ -1485,9 +1539,11 @@ check_all_operand_pods() {
   local ns="$PROJECT_CPD_INST_OPERANDS"
   local bad_found=0
   local total=0
+  local hands_off_found=0
   echo "▶ Checking all pods in operands namespace ($ns)"
   tmp_list=`mktemp 2>/dev/null || echo "/tmp/all_pods.$"`
   tmp_bad=`mktemp  2>/dev/null || echo "/tmp/all_bad.$"`
+  tmp_hands_off=`mktemp 2>/dev/null || echo "/tmp/all_hands_off.$$"`
   $OC -n "$ns" get pods --no-headers 2>/dev/null > "$tmp_list" || :
   while IFS= read -r line; do
     name="$(printf '%s\n' "$line" | awk '{print $1}')"
@@ -1499,6 +1555,14 @@ check_all_operand_pods() {
     # Skip pods already covered by check_wo_pods
     case "$name" in wo-*|*milvus*|sysbench-*) continue ;; esac
     total=`expr "${total:-0}" + 1`
+    
+    # Check for hands-off annotation
+    hands_off_annotation=`$OC -n "$ns" get pod "$name" -o jsonpath='{.metadata.annotations.wo\.watsonx\.ibm\.com/hands-off}' 2>/dev/null || :`
+    if [ "$hands_off_annotation" = "true" ]; then
+      printf "%s\t%s\t%s\t%s\t%s\n" "$name" "$ready" "$status" "${restarts:-?}" "${age:-?}" >> "$tmp_hands_off"
+      hands_off_found=1
+    fi
+    
     [ "$status" = "Completed" ] && continue
     current=`echo "$ready" | awk -F/ '{print $1}'`
     desired=`echo "$ready" | awk -F/ '{print $2}'`
@@ -1513,12 +1577,20 @@ check_all_operand_pods() {
 
   if [ "${total:-0}" -eq 0 ]; then
     echo "  ℹ️  No non orchestrate pods found in $ns"
-    rm -f "$tmp_bad"
+    rm -f "$tmp_bad" "$tmp_hands_off"
     return 0
   fi
+  
+  # Display hands-off pods if found
+  if [ "${hands_off_found:-0}" -eq 1 ]; then
+    echo "  ⚠️  Pods with 'wo.watsonx.ibm.com/hands-off: true' annotation (operator will not manage):"
+    awk -F"\t" '{printf "     - %s\n",$1}' "$tmp_hands_off"
+    echo ""
+  fi
+  
   if [ "${bad_found:-0}" -eq 0 ]; then
     echo "  ✅ All non orchestrate pods in $ns are healthy ($total pods checked)"
-    rm -f "$tmp_bad"
+    rm -f "$tmp_bad" "$tmp_hands_off"
     return 0
   else
     echo "  ⚠️  Some non orchestrate pods in $ns are not healthy:"
@@ -1528,7 +1600,7 @@ check_all_operand_pods() {
     if [ "${TROUBLESHOOT_MODE:-0}" -eq 1 ]; then
       prompt_restart_bad_pods "$ns" "$tmp_bad"
     fi
-    rm -f "$tmp_bad"
+    rm -f "$tmp_bad" "$tmp_hands_off"
     return 1
   fi
 }
@@ -2135,6 +2207,13 @@ check_requested_operator() {
   [ -z "$dep_name" ] && return 0
 
   checked_requested_operators=1
+  
+  # Check for hands-off annotation
+  hands_off_annotation=`$OC get deployment "$dep_name" -n "$PROJECT_CPD_INST_OPERATORS" -o jsonpath='{.metadata.annotations.wo\.watsonx\.ibm\.com/hands-off}' 2>/dev/null || :`
+  if [ "$hands_off_annotation" = "true" ]; then
+    hands_off_deployments="${hands_off_deployments}${dep_name}|${operator_label} "
+  fi
+  
   ready=$($OC get deployment "$dep_name" -n "$PROJECT_CPD_INST_OPERATORS" -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "0")
   ready="${ready:-0}"
   desired=$($OC get deployment "$dep_name" -n "$PROJECT_CPD_INST_OPERATORS" -o jsonpath='{.spec.replicas}' 2>/dev/null || echo "0")
@@ -2155,6 +2234,7 @@ check_requested_operator() {
 check_orchestrate_operators() {
   bad=0
   scaled_down_operators=""
+  hands_off_deployments=""
   checked_requested_operators=0
 
   echo "▶ Checking Requested Operators"
@@ -2182,6 +2262,16 @@ check_orchestrate_operators() {
 
   if [ "$checked_requested_operators" = "0" ]; then
     echo "  ℹ️  None of the requested operator deployments were found in $PROJECT_CPD_INST_OPERATORS"
+  fi
+  
+  # Display hands-off deployments if found
+  if [ -n "$hands_off_deployments" ]; then
+    echo
+    echo "  ⚠️  Deployments with 'wo.watsonx.ibm.com/hands-off: true' annotation (operator will not manage):"
+    for entry in $hands_off_deployments; do
+      dep_name="${entry%%|*}"
+      echo "     - $dep_name"
+    done
   fi
   
   # In troubleshoot mode ONLY, offer to scale up operators if they're scaled down
@@ -3929,9 +4019,11 @@ check_wo_pods_troubleshoot() {
   OCN="$OC -n $PROJECT_CPD_INST_OPERANDS"
   bad_found=0
   total_wo=0
+  hands_off_found=0
   echo "▶ Checking Orchestrate pods"
   tmp_list=`mktemp 2>/dev/null || echo "/tmp/wo_pods.$$"`
   tmp_bad=`mktemp 2>/dev/null || echo "/tmp/wo_bad.$$"`
+  tmp_hands_off=`mktemp 2>/dev/null || echo "/tmp/wo_hands_off_ts.$$"`
   $OCN get pods --no-headers 2>/dev/null > "$tmp_list" || :
   while IFS= read -r line; do
     name="$(printf '%s\n' "$line" | awk '{print $1}')"
@@ -3942,6 +4034,14 @@ check_wo_pods_troubleshoot() {
     [ -z "$name" ] && continue
     case "$name" in wo-*|tf-*|*milvus*) : ;; *) continue ;; esac
     total_wo=`expr "${total_wo:-0}" + 1`
+    
+    # Check for hands-off annotation
+    hands_off_annotation=`$OCN get pod "$name" -o jsonpath='{.metadata.annotations.wo\.watsonx\.ibm\.com/hands-off}' 2>/dev/null || :`
+    if [ "$hands_off_annotation" = "true" ]; then
+      printf "%s\t%s\t%s\t%s\t%s\n" "$name" "$ready" "$status" "${restarts:-?}" "${age:-?}" >> "$tmp_hands_off"
+      hands_off_found=1
+    fi
+    
     if [ "$status" = "Completed" ]; then continue; fi
     current=`echo "$ready" | awk -F/ '{print $1}'`
     total=`echo "$ready" | awk -F/ '{print $2}'`
@@ -3953,9 +4053,17 @@ check_wo_pods_troubleshoot() {
 
   if [ "${total_wo:-0}" -eq 0 ]; then
     echo "  ❌ No pods found with prefix 'wo-' in namespace $PROJECT_CPD_INST_OPERANDS."
-    rm -f "$tmp_list" "$tmp_bad"
+    rm -f "$tmp_list" "$tmp_bad" "$tmp_hands_off"
     return 1
   fi
+  
+  # Display hands-off pods if found
+  if [ "${hands_off_found:-0}" -eq 1 ]; then
+    echo "  ⚠️  Pods with 'wo.watsonx.ibm.com/hands-off: true' annotation (operator will not manage):"
+    awk -F"\t" '{printf "     - %s\n",$1}' "$tmp_hands_off"
+    echo ""
+  fi
+  
   if [ "${bad_found:-0}" -eq 0 ]; then
     echo "  ✅ All Orchestrate pods are healthy"
     echo
@@ -3975,7 +4083,7 @@ check_wo_pods_troubleshoot() {
       echo
       list_recent_errors_all_pods
     fi
-    rm -f "$tmp_list" "$tmp_bad"
+    rm -f "$tmp_list" "$tmp_bad" "$tmp_hands_off"
     return 0
   else
     echo "  ❌ Some pods are not healthy. Pods with issues:"
@@ -3986,7 +4094,7 @@ check_wo_pods_troubleshoot() {
     # Offer remediation options
     handle_bad_pods "$tmp_bad"
     
-    rm -f "$tmp_list" "$tmp_bad"
+    rm -f "$tmp_list" "$tmp_bad" "$tmp_hands_off"
     return 0
   fi
 }
@@ -4546,6 +4654,10 @@ run_health_checks() {
       pods_ok=1; if check_wo_pods; then pods_ok=0; fi
     fi
   fi
+
+  # Check operand deployments for hands-off annotation
+  check_operand_deployments_hands_off || :
+  echo
 
   section "Checking Orchestrate Jobs"
   if [ "${CHECK_JOBS:-1}" -eq 1 ]; then jobs_ok=1; if check_jobs; then jobs_ok=0; fi; fi
